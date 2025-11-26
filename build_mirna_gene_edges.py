@@ -1,132 +1,118 @@
-# scripts/build_mirna_gene_edges.py
 import pandas as pd
 from scipy.stats import pearsonr
 from tqdm import tqdm
 import os
 import logging
+import re
 
-# --- CẤU HÌNH ---
-GENE_EXPR_PATH = 'data/features/genes_expr.txt' 
-MIRNA_EXPR_PATH = 'data/features/mirnas.tsv'
-
-MI_RTARBASE_PATH = 'data/processed/mirtarbase_processed.csv'
-TARGETSCAN_PATH = 'data/processed/targetscan_processed.csv'
-
+# --- CONFIG ---
+GENE_PATH = 'data/features/genes_expr.txt'
+MIR_PATH = 'data/features/mirnas.tsv'
+MIRTAR_PATH = 'data/processed/mirtarbase_processed.csv'
+TARGET_PATH = 'data/processed/targetscan_processed.csv'
 OUTPUT_PATH = 'data/edges/gene_mirna.csv'
-P_VALUE_THRESHOLD = 0.05
-VALIDATED_BONUS = 0.1
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+P_THRESH = 0.05
+R_THRESH = -0.1 # Tương quan nghịch
+BONUS = 0.1
 
-# --- HÀM THỰC THI ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-def clean_patient_ids(df):
-    """Chuẩn hóa các cột tên bệnh nhân về dạng 12 ký tự (TCGA-XX-XXXX)."""
-    # Tạo một hàm lambda để áp dụng cho từng tên cột
-    # Tách chuỗi theo dấu '-', lấy 3 phần đầu, rồi ghép lại
-    # Ví dụ: 'TCGA-05-4244-01' -> 'TCGA-05-4244'
-    rename_function = lambda col: '-'.join(col.split('-')[:3])
-    df = df.rename(columns=rename_function)
-    return df
+def clean_cols(df):
+    df.columns = ['-'.join(x.split('-')[:3]) for x in df.columns]
+    return df.groupby(df.columns, axis=1).mean()
 
-def load_expression_data(gene_path, mirna_path):
-    """Tải và chuẩn bị dữ liệu biểu hiện với mã bệnh nhân đã được chuẩn hóa."""
-    logging.info("Loading expression data...")
+def build_edges():
+    logging.info("Loading data...")
     try:
-        gene_expr = pd.read_csv(gene_path, sep='\t', index_col='Hugo_Symbol')
-        if 'Entrez_Gene_Id' in gene_expr.columns:
-            gene_expr = gene_expr.drop(columns=['Entrez_Gene_Id'])
+        # Load và Clean Data
+        gene_df = pd.read_csv(GENE_PATH, sep='\t', index_col=0)
+        if 'Entrez_Gene_Id' in gene_df.columns: gene_df.drop(columns=['Entrez_Gene_Id'], inplace=True)
+        gene_df = clean_cols(gene_df[~gene_df.index.duplicated()])
+        
+        mir_df = pd.read_csv(MIR_PATH, sep='\t', index_col=0)
+        mir_df = clean_cols(mir_df)
+        
+        # Intersection Patients
+        common = gene_df.columns.intersection(mir_df.columns)
+        if len(common) == 0: return logging.error("No common patients.")
+        gene_df, mir_df = gene_df[common], mir_df[common]
+        
+        # Load Candidates
+        val = pd.read_csv(MIRTAR_PATH); val['validated'] = True
+        pred = pd.read_csv(TARGET_PATH); pred['validated'] = False
+        candidates = pd.concat([val, pred]).drop_duplicates(subset=['mirna_id', 'gene_id'])
+        
+        # --- BƯỚC 1: TẠO MAP (Regex) ---
+        # Map: Core Name (mir-122) -> Precursor ID (hsa-mir-122)
+        expr_map = {}
+        for idx in mir_df.index:
+            # Regex bắt: (mir hoặc let) - (chuỗi số/chữ)
+            m = re.search(r'(mir|let)-([0-9a-z]+)', idx, re.IGNORECASE)
+            if m:
+                # Key chuẩn hóa về dạng: mir-122 (chữ thường)
+                core = m.group(0).lower().replace('mir', 'mir')
+                expr_map[core] = idx # Lưu ID gốc trong file
+                
+        logging.info(f"Expression Map created for {len(expr_map)} precursors.")
+
+        # --- BƯỚC 2: TÍNH TOÁN ---
+        results = []
+        gene_cache = gene_df.to_dict('index')
+        mir_cache = mir_df.to_dict('index')
+        valid_genes = set(gene_df.index)
+
+        for _, row in tqdm(candidates.iterrows(), total=len(candidates), desc="Processing"):
+            mature_id = row['mirna_id'] # VD: hsa-miR-122-5p
+            gene = row['gene_id']
             
-        mirna_expr = pd.read_csv(mirna_path, sep='\t', index_col=0)
-        
-        # --- THAY ĐỔI QUAN TRỌNG Ở ĐÂY ---
-        # Chuẩn hóa tên cột (mã bệnh nhân) cho cả hai dataframe
-        logging.info("Normalizing patient IDs...")
-        gene_expr = clean_patient_ids(gene_expr)
-        mirna_expr = clean_patient_ids(mirna_expr)
-        # ---------------------------------
-        
-        common_patients = gene_expr.columns.intersection(mirna_expr.columns)
-        if len(common_patients) == 0:
-            logging.warning("Found 0 common patients. Please check patient ID formats in source files.")
-            # Trả về DataFrame rỗng để tránh lỗi sau này, nhưng vẫn in cảnh báo
-            return pd.DataFrame(), pd.DataFrame()
+            if gene not in valid_genes: continue
 
-        logging.info(f"Found {len(common_patients)} common patients between mRNA and miRNA data.")
-        return gene_expr[common_patients], mirna_expr[common_patients]
-        
-    except FileNotFoundError as e:
-        logging.error(f"FATAL: Expression file not found: {e.filename}. Please check paths.")
-        return None, None
-
-def load_candidate_interactions(mirtarbase_path, targetscan_path):
-    """Tải và hợp nhất các tương tác ứng viên."""
-    logging.info("Loading and merging candidate interactions...")
-    try:
-        validated = pd.read_csv(mirtarbase_path)
-        predicted = pd.read_csv(targetscan_path)
-        
-        validated['validated'] = True
-        
-        all_interactions = pd.concat([validated, predicted])
-        all_interactions = all_interactions.drop_duplicates(subset=['mirna_id', 'gene_id'], keep='first').reset_index(drop=True)
-        all_interactions['validated'] = all_interactions['validated'].fillna(False)
-        
-        logging.info(f"Loaded {len(all_interactions)} unique candidate interactions.")
-        return all_interactions
-    except FileNotFoundError as e:
-        logging.error(f"FATAL: Processed interaction file not found: {e.filename}.")
-        return None
-
-def calculate_correlation_weights(gene_expr, mirna_expr, candidates):
-    """Tính toán trọng số dựa trên tương quan."""
-    if gene_expr.empty or mirna_expr.empty:
-        logging.error("Expression data is empty. Cannot calculate correlations.")
-        return pd.DataFrame()
-
-    logging.info("Calculating correlation-based weights...")
-    
-    valid_genes = gene_expr.index
-    valid_mirnas = mirna_expr.index
-    candidates = candidates[candidates['gene_id'].isin(valid_genes) & candidates['mirna_id'].isin(valid_mirnas)]
-    
-    results = []
-    for _, row in tqdm(candidates.iterrows(), total=candidates.shape[0], desc="Correlating pairs"):
-        mirna, gene, is_validated = row['mirna_id'], row['gene_id'], row['validated']
-        
-        mirna_vec = mirna_expr.loc[mirna].astype(float)
-        gene_vec = gene_expr.loc[gene].astype(float)    
-        
-        if mirna_vec.var() == 0 or gene_vec.var() == 0: continue
-
-        r, p_value = pearsonr(mirna_vec, gene_vec)
-
-        if p_value < P_VALUE_THRESHOLD and r < 0:
-            weight = abs(r)
-            if is_validated:
-                weight = min(1.0, weight + VALIDATED_BONUS)
+            # Tìm ID Precursor tương ứng (Cha)
+            target_pre_id = None
+            m = re.search(r'(mir|let)-([0-9a-z]+)', mature_id, re.IGNORECASE)
+            if m:
+                core = m.group(0).lower().replace('mir', 'mir')
+                target_pre_id = expr_map.get(core)
             
-            results.append({'mirna_id': mirna, 'gene_id': gene, 'weight': weight})
+            if not target_pre_id: continue # Không có data biểu hiện -> Bỏ qua
+
+            # Lấy vector & Tính Correlation
+            try:
+                vec_m = pd.Series(mir_cache[target_pre_id])
+                vec_g = pd.Series(gene_cache[gene])
+                
+                if vec_m.var() == 0 or vec_g.var() == 0: continue
+                
+                r, p = pearsonr(vec_m, vec_g)
+                
+                if p < P_THRESH and r < R_THRESH:
+                    w = abs(r)
+                    if row['validated']: w = min(1.0, w + BONUS)
+                    
+                    # --- QUAN TRỌNG: LƯU ID PRECURSOR ---
+                    results.append({
+                        'mirna_id': target_pre_id, # Lưu ID cha để khớp với Node Features
+                        'gene_id': gene,
+                        'weight': w
+                    })
+            except: continue
+
+        # --- BƯỚC 3: GỘP TRÙNG LẶP ---
+        # Nếu cả 5p và 3p cùng trỏ vào 1 gene -> Giữ cái có trọng số cao nhất
+        final_df = pd.DataFrame(results)
+        if not final_df.empty:
+            final_df = final_df.sort_values('weight', ascending=False)
+            final_df = final_df.drop_duplicates(subset=['mirna_id', 'gene_id'], keep='first')
             
-    return pd.DataFrame(results)
+            os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+            final_df.to_csv(OUTPUT_PATH, index=False)
+            logging.info(f"SUCCESS: {len(final_df)} edges saved to {OUTPUT_PATH}")
+        else:
+            logging.warning("No edges passed filter.")
+
+    except Exception as e:
+        logging.error(f"Pipeline failed: {e}")
 
 if __name__ == "__main__":
-    if not (os.path.exists(MI_RTARBASE_PATH) and os.path.exists(TARGETSCAN_PATH)):
-        logging.error("Processed interaction files not found! Please run 'preprocess_interaction_data.py' first.")
-    else:
-        gene_df, mirna_df = load_expression_data(GENE_EXPR_PATH, MIRNA_EXPR_PATH)
-        
-        if gene_df is not None and not gene_df.empty:
-            candidate_df = load_candidate_interactions(MI_RTARBASE_PATH, TARGETSCAN_PATH)
-            
-            if candidate_df is not None:
-                final_edges_df = calculate_correlation_weights(gene_df, mirna_df, candidate_df)
-
-                if not final_edges_df.empty:
-                    output_df = final_edges_df.sort_values(by='weight', ascending=False)
-                    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-                    output_df.to_csv(OUTPUT_PATH, index=False)
-                    logging.info(f"--- PIPELINE FINISHED ---")
-                    logging.info(f"Successfully saved {len(output_df)} edges to {OUTPUT_PATH}")
-                else:
-                    logging.warning("Pipeline finished, but no significant edges were found with the current thresholds.")
+    build_edges()
