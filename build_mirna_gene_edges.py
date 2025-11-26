@@ -95,7 +95,7 @@ def calculate_correlation_weights(gene_expr, mirna_expr, candidates):
         mirna, gene, is_validated = row['mirna_id'], row['gene_id'], row['validated']
         
         mirna_vec = mirna_expr.loc[mirna].astype(float)
-        gene_vec = gene_expr.loc[gene].astype(float)
+        gene_vec = gene_expr.loc[gene].astype(float)    
         
         if mirna_vec.var() == 0 or gene_vec.var() == 0: continue
 
